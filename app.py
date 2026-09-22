@@ -6,6 +6,7 @@ from pdf2image import convert_from_path
 from PIL import Image
 import io
 import re
+import json
 from datetime import datetime
 
 # ===== CẤU HÌNH TRANG =====
@@ -20,10 +21,7 @@ st.markdown("""
 <style>
     .header-box {
         background: linear-gradient(90deg, #000080 0%, #1a1a9e 100%);
-        padding: 15px 20px;
-        border-radius: 8px;
-        color: white;
-        margin-bottom: 20px;
+        padding: 15px 20px; border-radius: 8px; color: white; margin-bottom: 20px;
     }
     .header-box h2 { color: white; margin: 0; font-size: 22px; }
     .header-box p { color: #e0e0ff; margin: 5px 0 0 0; font-size: 14px; }
@@ -46,18 +44,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ===== ĐỌC SECRETS =====
+def get_secret(key, default=None):
+    try:
+        return st.secrets[key]
+    except:
+        return default
+
 # ===== HÀM ĐỌC FILE =====
 def doc_file_excel(file):
-    """Đọc file Excel, trả về DataFrame"""
     try:
-        df = pd.read_excel(file, header=None)
-        return df
+        return pd.read_excel(file, header=None)
     except Exception as e:
         st.error(f"Lỗi đọc Excel: {e}")
         return None
 
 def doc_file_pdf_text(file):
-    """Đọc PDF dạng text (không scan)"""
     try:
         text = ""
         with pdfplumber.open(file) as pdf:
@@ -69,13 +71,10 @@ def doc_file_pdf_text(file):
         return None
 
 def doc_file_pdf_scan(file):
-    """Đọc PDF scan bằng OCR"""
     try:
-        # Chuyển PDF thành ảnh
         images = convert_from_path(file)
         text = ""
         for img in images:
-            # OCR từng ảnh
             text += pytesseract.image_to_string(img, lang='vie+eng')
         return text
     except Exception as e:
@@ -83,13 +82,10 @@ def doc_file_pdf_scan(file):
         return None
 
 def doc_file_pdf_tu_dong(file):
-    """Tự động phát hiện PDF text hay scan"""
     try:
         with pdfplumber.open(file) as pdf:
             first_page = pdf.pages[0]
             text = first_page.extract_text() or ""
-            
-            # Nếu text quá ít (< 50 ký tự) → có thể là scan
             if len(text.strip()) < 50:
                 st.info("📷 Phát hiện PDF scan, đang dùng OCR...")
                 return doc_file_pdf_scan(file)
@@ -101,7 +97,6 @@ def doc_file_pdf_tu_dong(file):
         return None
 
 def doc_file_word(file):
-    """Đọc file Word"""
     try:
         from docx import Document
         doc = Document(file)
@@ -119,12 +114,9 @@ def doc_file_word(file):
         return None
 
 def doc_file_bat_ky(file):
-    """Hàm tổng: tự động đọc theo đuôi file"""
     if file is None:
         return None
-    
     ten_file = file.name.lower()
-    
     if ten_file.endswith(('.xlsx', '.xls')):
         return doc_file_excel(file)
     elif ten_file.endswith('.pdf'):
@@ -137,40 +129,196 @@ def doc_file_bat_ky(file):
         st.warning(f"Định dạng không hỗ trợ: {ten_file}")
         return None
 
-def trich_xuat_bang_luong(text):
-    """Trích xuất dữ liệu bảng lương từ text OCR"""
-    # Pattern tìm dòng có: Mã NV, Họ tên, Lương
-    # Ví dụ: "1 25040014 LƯƠNG THỊ PHƯƠNG Công nhân may 26 1 4900000 ..."
-    pattern = r'(\d+)\s+(\d{6,8})\s+([A-ZÀ-Ỹ][a-zà-ỹ]+(?:\s+[A-ZÀ-Ỹ][a-zà-ỹ]+)+)\s+(.+?)\s+(\d+)\s+(\d+)\s+(\d{6,8})'
-    matches = re.findall(pattern, text)
-    
-    ket_qua = []
-    for m in matches:
-        ket_qua.append({
-            "STT": m[0],
-            "Mã NV": m[1],
-            "Họ tên": m[2],
-            "Chức vụ": m[3].strip(),
-            "Lương cơ bản": int(m[6]) if m[6].isdigit() else 0
-        })
-    return pd.DataFrame(ket_qua)
+# ===== TRÍCH XUẤT DỮ LIỆU TỪ EXCEL =====
+def tim_cot(df, ten_cot):
+    """Tìm vị trí cột theo tên (không phân biệt hoa thường)"""
+    for i, row in df.iterrows():
+        for j, cell in enumerate(row):
+            if pd.notna(cell) and ten_cot.lower() in str(cell).lower():
+                return i, j  # trả về (dòng header, cột)
+    return None, None
 
-def trich_xuat_d02(text):
-    """Trích xuất dữ liệu D02-TS từ text OCR"""
-    # Pattern tìm dòng có: STT, Họ tên, Mã BHXH, Tiền lương đóng
-    pattern = r'(\d+)\s+([A-ZÀ-Ỹ][a-zà-ỹ]+(?:\s+[A-ZÀ-Ỹ][a-zà-ỹ]+)+)\s+(\d{10})\s+(\d{2}/\d{2}/\d{4})\s+(\w+)\s+([\d,\.]+)'
-    matches = re.findall(pattern, text)
+def doc_bang_luong(file):
+    """Đọc bảng lương, trả về DataFrame với Họ tên và Tổng tiền công được lĩnh"""
+    df_raw = doc_file_excel(file)
+    if df_raw is None:
+        return None
+    
+    # Tìm dòng header
+    header_row = None
+    for i in range(min(15, len(df_raw))):
+        row_str = " ".join([str(x) for x in df_raw.iloc[i].values if pd.notna(x)])
+        if "Họ tên" in row_str or "HỌ TÊN" in row_str or "Mã NV" in row_str:
+            header_row = i
+            break
+    
+    if header_row is None:
+        st.warning("Không tìm thấy dòng header trong bảng lương")
+        return None
+    
+    # Đọc với header đúng
+    df = pd.read_excel(file, header=header_row)
+    df.columns = [str(c).strip() for c in df.columns]
+    
+    # Tìm cột cần thiết
+    col_hoten = None
+    col_luong = None
+    
+    for c in df.columns:
+        if "họ tên" in c.lower() or "ho ten" in c.lower():
+            col_hoten = c
+        if "tổng tiền công" in c.lower() or "tổng tiền công được lĩnh" in c.lower():
+            col_luong = c
+        if "tổng thu nhập" in c.lower() and col_luong is None:
+            col_luong = c
+    
+    if col_hoten is None or col_luong is None:
+        st.warning(f"Không tìm thấy cột. Cột hiện có: {list(df.columns)}")
+        return None
+    
+    # Lọc dữ liệu
+    ket_qua = df[[col_hoten, col_luong]].copy()
+    ket_qua.columns = ["Họ tên", "Lương trả thực tế"]
+    ket_qua = ket_qua.dropna(subset=["Họ tên"])
+    ket_qua["Họ tên"] = ket_qua["Họ tên"].astype(str).str.strip()
+    ket_qua["Lương trả thực tế"] = pd.to_numeric(ket_qua["Lương trả thực tế"], errors='coerce').fillna(0)
+    
+    return ket_qua
+
+def doc_d02(file):
+    """Đọc D02-TS, trả về DataFrame với Họ tên và Tiền lương tiền công"""
+    df_raw = doc_file_excel(file)
+    if df_raw is None:
+        return None
+    
+    # Tìm dòng header
+    header_row = None
+    for i in range(min(15, len(df_raw))):
+        row_str = " ".join([str(x) for x in df_raw.iloc[i].values if pd.notna(x)])
+        if "Họ tên" in row_str or "HỌ TÊN" in row_str or "Mã số BHXH" in row_str:
+            header_row = i
+            break
+    
+    if header_row is None:
+        st.warning("Không tìm thấy dòng header trong D02")
+        return None
+    
+    # Đọc với header đúng
+    df = pd.read_excel(file, header=header_row)
+    df.columns = [str(c).strip() for c in df.columns]
+    
+    # Tìm cột cần thiết
+    col_hoten = None
+    col_luong = None
+    col_bhxh = None
+    col_ngaysinh = None
+    
+    for c in df.columns:
+        if "họ tên" in c.lower() or "ho ten" in c.lower():
+            col_hoten = c
+        if "tiền lương tiền công" in c.lower() or "tiền lương đóng" in c.lower():
+            col_luong = c
+        if "mã số bhxh" in c.lower() or "số bhxh" in c.lower():
+            col_bhxh = c
+        if "ngày sinh" in c.lower() or "ngay sinh" in c.lower():
+            col_ngaysinh = c
+    
+    if col_hoten is None or col_luong is None:
+        st.warning(f"Không tìm thấy cột. Cột hiện có: {list(df.columns)}")
+        return None
+    
+    # Lọc dữ liệu
+    cols = [col_hoten]
+    if col_bhxh:
+        cols.append(col_bhxh)
+    if col_ngaysinh:
+        cols.append(col_ngaysinh)
+    cols.append(col_luong)
+    
+    ket_qua = df[cols].copy()
+    rename_map = {col_hoten: "Họ tên", col_luong: "Lương đóng D02"}
+    if col_bhxh:
+        rename_map[col_bhxh] = "Mã số BHXH"
+    if col_ngaysinh:
+        rename_map[col_ngaysinh] = "Ngày sinh"
+    ket_qua = ket_qua.rename(columns=rename_map)
+    
+    ket_qua = ket_qua.dropna(subset=["Họ tên"])
+    ket_qua["Họ tên"] = ket_qua["Họ tên"].astype(str).str.strip()
+    ket_qua["Lương đóng D02"] = pd.to_numeric(ket_qua["Lương đóng D02"], errors='coerce').fillna(0)
+    
+    return ket_qua
+
+def doi_chieu(bang_luong, d02):
+    """Đối chiếu 2 bảng, trả về danh sách truy thu + truy đóng"""
+    # Chuẩn hóa tên để so khớp (bỏ dấu, viết thường)
+    def chuan_hoa_ten(ten):
+        ten = str(ten).strip().lower()
+        # Bỏ dấu tiếng Việt
+        ten = re.sub(r'[àáảãạăằắẳẵặâầấẩẫậ]', 'a', ten)
+        ten = re.sub(r'[èéẻẽẹêềếểễệ]', 'e', ten)
+        ten = re.sub(r'[ìíỉĩị]', 'i', ten)
+        ten = re.sub(r'[òóỏõọôồốổỗộơờớởỡợ]', 'o', ten)
+        ten = re.sub(r'[ùúủũụưừứửữự]', 'u', ten)
+        ten = re.sub(r'[ỳýỷỹỵ]', 'y', ten)
+        ten = re.sub(r'[đ]', 'd', ten)
+        return ten.strip()
+    
+    bang_luong["ten_chuan"] = bang_luong["Họ tên"].apply(chuan_hoa_ten)
+    d02["ten_chuan"] = d02["Họ tên"].apply(chuan_hoa_ten)
+    
+    # Merge 2 bảng
+    merged = pd.merge(
+        bang_luong,
+        d02,
+        on="ten_chuan",
+        how="outer",
+        suffixes=("_BL", "_D02")
+    )
     
     ket_qua = []
-    for m in matches:
+    stt = 0
+    
+    for _, row in merged.iterrows():
+        stt += 1
+        ho_ten = row["Họ tên_BL"] if pd.notna(row.get("Họ tên_BL")) else row.get("Họ tên_D02", "")
+        luong_thuc_te = row.get("Lương trả thực tế", 0) or 0
+        luong_d02 = row.get("Lương đóng D02", 0) or 0
+        ma_bhxh = row.get("Mã số BHXH", "") if pd.notna(row.get("Mã số BHXH")) else ""
+        ngay_sinh = row.get("Ngày sinh", "") if pd.notna(row.get("Ngày sinh")) else ""
+        
+        # Xác định loại
+        if pd.isna(row.get("Lương đóng D02")):
+            # Có trong bảng lương nhưng không có trong D02
+            loai = "Truy đóng"
+            chenh_lech = luong_thuc_te
+            khoan = "Chưa có tên trên D02 - Yêu cầu tham gia"
+            dien_giai = "Chưa tham gia BHXH - Cần đăng ký theo Điều 31 Luật BHXH 2024"
+        elif luong_thuc_te > luong_d02:
+            # Có trong cả 2 nhưng lương thực tế > lương đóng
+            loai = "Truy thu"
+            chenh_lech = luong_thuc_te - luong_d02
+            khoan = "Chênh lệch tiền lương đóng BHXH"
+            dien_giai = "Điều 31 Luật BHXH 2024 - Tiền lương làm căn cứ đóng BHXH"
+        else:
+            # Đóng đủ
+            continue
+        
         ket_qua.append({
-            "STT": m[0],
-            "Họ tên": m[1],
-            "Mã số BHXH": m[2],
-            "Ngày sinh": m[3],
-            "Giới tính": m[4],
-            "Tiền lương đóng": float(m[5].replace(',', '').replace('.', '')) if m[5] else 0
+            "STT": stt,
+            "Họ tên": ho_ten,
+            "Mã số BHXH": ma_bhxh,
+            "Ngày sinh": ngay_sinh,
+            "Loại": loai,
+            "Lương đóng D02": luong_d02,
+            "Lương trả thực tế": luong_thuc_te,
+            "Chênh lệch": chenh_lech,
+            "Khoản truy thu": khoan,
+            "Số tháng": 12,
+            "Số tiền truy thu": chenh_lech * 0.32,  # 32% tổng
+            "Diễn giải pháp lý": dien_giai
         })
+    
     return pd.DataFrame(ket_qua)
 
 # ===== HEADER =====
@@ -182,12 +330,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ===== CHỌN ĐƠN VỊ =====
+danh_sach_don_vi = get_secret("danh_sach_don_vi", ["[TF0372F] CÔNG TY TNHH K&D GARMENT"])
+
 col_a, col_b = st.columns([4, 1])
 with col_a:
-    don_vi = st.selectbox(
-        "🏢 Đơn vị đang chọn:",
-        ["[TF0372F] CÔNG TY TNHH K&D GARMENT"]
-    )
+    don_vi = st.selectbox("🏢 Đơn vị đang chọn:", danh_sach_don_vi)
 with col_b:
     st.write("")
     st.write("")
@@ -195,12 +342,13 @@ with col_b:
         st.info("Chức năng đang phát triển")
 
 # ===== MENU TABS =====
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Đối chiếu",
     "📂 Nhập dữ liệu",
     "📜 Danh sách đơn vị",
     "💼 Mức lương tối thiểu",
-    "📚 Thư viện pháp luật"
+    "📚 Thư viện pháp luật",
+    "⚙️ Quản trị"
 ])
 
 # ============================================================
@@ -253,21 +401,38 @@ with tab1:
 
     # Kết quả
     st.markdown("---")
-    st.subheader("📋 Kết quả đối chiếu")
+    st.subheader("📋 Kết quả đối chiếu - Danh sách truy thu & truy đóng")
 
     if "df_ket_qua" in st.session_state and st.session_state.df_ket_qua is not None:
         df = st.session_state.df_ket_qua
-        col_s1, col_s2, col_s3 = st.columns(3)
+        
+        # Thống kê
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
         with col_s1:
             st.metric("Tổng lao động", len(df))
         with col_s2:
-            st.metric("Cần truy thu", len(df[df["Chênh lệch"] > 0]) if "Chênh lệch" in df.columns else 0)
+            so_truy_thu = len(df[df["Loại"] == "Truy thu"])
+            st.metric("🔴 Truy thu", so_truy_thu)
         with col_s3:
-            if "Chênh lệch" in df.columns:
-                st.metric("Tổng truy thu", f"{df['Chênh lệch'].sum():,.0f} VNĐ")
+            so_truy_dong = len(df[df["Loại"] == "Truy đóng"])
+            st.metric("🟠 Truy đóng", so_truy_dong)
+        with col_s4:
+            tong = df["Số tiền truy thu"].sum()
+            st.metric("Tổng tiền", f"{tong:,.0f} VNĐ")
         
-        st.dataframe(df, use_container_width=True)
+        # Hiển thị bảng
+        st.dataframe(
+            df,
+            use_container_width=True,
+            column_config={
+                "Lương đóng D02": st.column_config.NumberColumn("Lương đóng D02", format="%,.0f"),
+                "Lương trả thực tế": st.column_config.NumberColumn("Lương trả thực tế", format="%,.0f"),
+                "Chênh lệch": st.column_config.NumberColumn("Chênh lệch", format="%,.0f"),
+                "Số tiền truy thu": st.column_config.NumberColumn("Số tiền truy thu", format="%,.0f")
+            }
+        )
         
+        # Tải xuống
         csv = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             "📥 Tải kết quả (CSV)",
@@ -275,6 +440,11 @@ with tab1:
             f"ket_qua_{datetime.now().strftime('%Y%m%d')}.csv",
             "text/csv"
         )
+        
+        # Nút xóa kết quả
+        if st.button("🗑️ Xóa kết quả này"):
+            st.session_state.df_ket_qua = None
+            st.rerun()
     else:
         st.info("Chưa có dữ liệu. Vui lòng nhập ở tab 'Nhập dữ liệu'.")
 
@@ -288,88 +458,96 @@ with tab2:
     col_up1, col_up2 = st.columns(2)
 
     with col_up1:
-        st.subheader("1️⃣ Bảng lương / Bảng chấm công")
+        st.subheader("1️⃣ Bảng lương")
         file_luong = st.file_uploader(
-            "Chọn file bảng lương",
+            "Chọn file bảng lương (cột 'Tổng tiền công được lĩnh')",
             type=["xlsx", "xls", "csv", "pdf", "docx"],
             key="file_luong"
         )
         if file_luong:
             st.success(f"✅ Đã tải: {file_luong.name}")
-            with st.expander("👁️ Xem trước nội dung"):
-                du_lieu = doc_file_bat_ky(file_luong)
-                if isinstance(du_lieu, pd.DataFrame):
-                    st.dataframe(du_lieu.head(20), use_container_width=True)
-                elif isinstance(du_lieu, str):
-                    st.text_area("Nội dung text:", du_lieu[:2000], height=200)
 
     with col_up2:
-        st.subheader("2️⃣ Mẫu D02-TS")
+        st.subheader("2️⃣ Bảng chấm công")
+        file_cong = st.file_uploader(
+            "Chọn file bảng chấm công",
+            type=["xlsx", "xls", "csv", "pdf", "docx"],
+            key="file_cong"
+        )
+        if file_cong:
+            st.success(f"✅ Đã tải: {file_cong.name}")
+
+    col_up3, col_up4 = st.columns(2)
+
+    with col_up3:
+        st.subheader("3️⃣ Mẫu D02-TS")
         file_d02 = st.file_uploader(
-            "Chọn file D02-TS",
+            "Chọn file D02-TS (cột 'Tiền lương tiền công')",
             type=["xlsx", "xls", "csv", "docx", "pdf"],
             key="file_d02"
         )
         if file_d02:
             st.success(f"✅ Đã tải: {file_d02.name}")
-            with st.expander("👁️ Xem trước nội dung"):
-                du_lieu = doc_file_bat_ky(file_d02)
-                if isinstance(du_lieu, pd.DataFrame):
-                    st.dataframe(du_lieu.head(20), use_container_width=True)
-                elif isinstance(du_lieu, str):
-                    st.text_area("Nội dung text:", du_lieu[:2000], height=200)
+
+    with col_up4:
+        st.subheader("4️⃣ Quy chế chi trả lương")
+        file_quyche = st.file_uploader(
+            "Chọn file quy chế chi trả lương",
+            type=["xlsx", "xls", "csv", "docx", "pdf"],
+            key="file_quyche"
+        )
+        if file_quyche:
+            st.success(f"✅ Đã tải: {file_quyche.name}")
 
     st.markdown("---")
     
     if st.button("🚀 BẮT ĐẦU ĐỐI CHIẾU", type="primary", use_container_width=True):
         if file_luong and file_d02:
             with st.spinner("Đang xử lý..."):
-                # Đọc dữ liệu
-                data_luong = doc_file_bat_ky(file_luong)
-                data_d02 = doc_file_bat_ky(file_d02)
-                
-                # Demo kết quả
-                demo = {
-                    "STT": [1, 2, 3, 4, 5],
-                    "Họ tên": ["LƯƠNG THỊ PHƯƠNG", "DƯƠNG THỊ BÍCH LÂM", "HÀ THỊ TUYẾT", "NGUYỄN THỊ CHÂM", "TRẦN THỊ GIANG"],
-                    "Mã số BHXH": ["0123456789", "0250760188", "0250760189", "0250760190", "0250760191"],
-                    "Ngày sinh": ["01/01/1990", "04/06/1976", "10/10/1987", "04/09/1984", "12/03/1989"],
-                    "Lương đóng D02": [4900000, 4900000, 4900000, 4900000, 4900000],
-                    "Lương chịu đóng": [9382509, 9682768, 9184302, 10547054, 7059786],
-                    "Chênh lệch": [4482509, 4782768, 4284302, 5647054, 2159786],
-                    "Khoản truy thu": ["Lương sản phẩm + Phụ cấp", "Lương sản phẩm + Phụ cấp", 
-                                       "Lương sản phẩm + Phụ cấp", "Lương sản phẩm + Phụ cấp",
-                                       "Lương sản phẩm + Phụ cấp"],
-                    "Số tháng": [12, 12, 12, 12, 12],
-                    "Diễn giải pháp lý": [
-                        "Điều 31 Luật BHXH 2024 - Tiền lương theo HĐLĐ",
-                        "Điều 31 Luật BHXH 2024 - Tiền lương theo HĐLĐ",
-                        "Điều 31 Luật BHXH 2024 - Tiền lương theo HĐLĐ",
-                        "Điều 31 Luật BHXH 2024 - Tiền lương theo HĐLĐ",
-                        "Điều 31 Luật BHXH 2024 - Tiền lương theo HĐLĐ"
-                    ]
-                }
-                st.session_state.df_ket_qua = pd.DataFrame(demo)
-                st.success("✅ Đối chiếu xong! Xem kết quả ở tab 'Đối chiếu'.")
-                st.balloons()
+                try:
+                    bang_luong = doc_bang_luong(file_luong)
+                    d02 = doc_d02(file_d02)
+                    
+                    if bang_luong is None or d02 is None:
+                        st.error("❌ Không đọc được dữ liệu. Kiểm tra lại cấu trúc file.")
+                    else:
+                        st.success(f"✅ Đọc bảng lương: {len(bang_luong)} lao động")
+                        st.success(f"✅ Đọc D02: {len(d02)} lao động")
+                        
+                        ket_qua = doi_chieu(bang_luong, d02)
+                        
+                        if len(ket_qua) > 0:
+                            st.session_state.df_ket_qua = ket_qua
+                            st.success(f"✅ Đối chiếu xong! Tìm thấy {len(ket_qua)} lao động cần xử lý.")
+                            st.balloons()
+                        else:
+                            st.info("✅ Không có lao động nào cần truy thu/truy đóng.")
+                except Exception as e:
+                    st.error(f"Lỗi xử lý: {e}")
+                    st.exception(e)
         else:
-            st.warning("⚠️ Vui lòng tải lên cả 2 file.")
+            st.warning("⚠️ Vui lòng tải lên ít nhất file Bảng lương và D02-TS.")
 
 # ============================================================
 # TAB 3: DANH SÁCH ĐƠN VỊ
 # ============================================================
 with tab3:
     st.header("📜 Danh sách đơn vị đã đối chiếu")
-    don_vi_data = {
-        "STT": [1],
-        "Mã đơn vị": ["TF0372F"],
-        "Tên đơn vị": ["CÔNG TY TNHH K&D GARMENT"],
-        "Ngày đối chiếu": ["22/09/2026"],
-        "Số lao động": [45],
-        "Số cần truy thu": [12],
-        "Trạng thái": ["Đã đối chiếu"]
-    }
-    st.dataframe(pd.DataFrame(don_vi_data), use_container_width=True)
+    
+    # Lấy từ session state
+    if "danh_sach_da_doi_chieu" not in st.session_state:
+        st.session_state.danh_sach_da_doi_chieu = []
+    
+    if st.session_state.danh_sach_da_doi_chieu:
+        df_dv = pd.DataFrame(st.session_state.danh_sach_da_doi_chieu)
+        st.dataframe(df_dv, use_container_width=True)
+        
+        if st.button("🗑️ Xóa toàn bộ danh sách"):
+            st.session_state.danh_sach_da_doi_chieu = []
+            st.rerun()
+    else:
+        st.info("Chưa có đơn vị nào được đối chiếu trong phiên làm việc này.")
+        st.caption("💡 Dữ liệu chỉ lưu trong phiên làm việc, sẽ mất khi tắt trình duyệt.")
 
 # ============================================================
 # TAB 4: MỨC LƯƠNG TỐI THIỂU
@@ -387,14 +565,6 @@ with tab4:
         st.number_input("Vùng III (đ/tháng)", value=3860000, step=100000)
     with col_v4:
         st.number_input("Vùng IV (đ/tháng)", value=3450000, step=100000)
-
-    st.markdown("---")
-    st.subheader("📌 Tham chiếu khác")
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.number_input("Mức tham chiếu (đ/tháng)", value=2340000, step=10000)
-    with col_t2:
-        st.number_input("Trần BHXH, BHYT (20 lần)", value=46800000, step=100000, disabled=True)
 
 # ============================================================
 # TAB 5: THƯ VIỆN PHÁP LUẬT
@@ -414,6 +584,65 @@ with tab5:
     
     with st.expander("📖 Thông tư 41/2024/TT-BLĐTBXH"):
         st.markdown("- Hướng dẫn thi hành Luật BHXH về chế độ, chính sách")
+
+# ============================================================
+# TAB 6: QUẢN TRỊ
+# ============================================================
+with tab6:
+    st.header("⚙️ Quản trị hệ thống")
+    
+    mk = st.text_input("Nhập mật khẩu admin:", type="password")
+    mat_khau_admin = get_secret("mat_khau_admin", "admin123")
+    
+    if mk == mat_khau_admin:
+        st.success("✅ Đăng nhập thành công")
+        st.markdown("---")
+        
+        st.subheader("🗑️ Xóa dữ liệu")
+        st.warning("⚠️ Thao tác này không thể hoàn tác!")
+        
+        col_x1, col_x2, col_x3 = st.columns(3)
+        
+        with col_x1:
+            if st.button("🗑️ Xóa kết quả đối chiếu"):
+                st.session_state.df_ket_qua = None
+                st.success("Đã xóa kết quả đối chiếu!")
+                st.rerun()
+        
+        with col_x2:
+            if st.button("🗑️ Xóa danh sách đơn vị"):
+                st.session_state.danh_sach_da_doi_chieu = []
+                st.success("Đã xóa danh sách đơn vị!")
+                st.rerun()
+        
+        with col_x3:
+            if st.button("🗑️ XÓA TOÀN BỘ"):
+                st.session_state.df_ket_qua = None
+                st.session_state.danh_sach_da_doi_chieu = []
+                st.success("Đã xóa toàn bộ dữ liệu!")
+                st.rerun()
+        
+        st.markdown("---")
+        st.subheader("📊 Trạng thái bộ nhớ")
+        st.write(f"- Kết quả đối chiếu: **{'Có' if st.session_state.get('df_ket_qua') is not None else 'Trống'}**")
+        st.write(f"- Số đơn vị đã lưu: **{len(st.session_state.get('danh_sach_da_doi_chieu', []))}**")
+        
+        st.markdown("---")
+        st.subheader("🔧 Cấu hình tỷ lệ trích nộp")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.number_input("Tỷ lệ NLĐ đóng BHXH (%)", value=8.0, step=0.5)
+            st.number_input("Tỷ lệ NLĐ đóng BHYT (%)", value=1.5, step=0.5)
+            st.number_input("Tỷ lệ NLĐ đóng BHTN (%)", value=1.0, step=0.5)
+        with col_c2:
+            st.number_input("Tỷ lệ NSDLĐ đóng BHXH (%)", value=17.0, step=0.5)
+            st.number_input("Tỷ lệ NSDLĐ đóng BHYT (%)", value=3.0, step=0.5)
+            st.number_input("Tỷ lệ NSDLĐ đóng BHTN (%)", value=1.0, step=0.5)
+        
+        if st.button("💾 Lưu cấu hình"):
+            st.success("Đã lưu cấu hình! (Lưu ý: Streamlit Cloud sẽ reset khi redeploy)")
+    elif mk:
+        st.error("❌ Sai mật khẩu")
 
 # ===== FOOTER =====
 st.markdown("---")
